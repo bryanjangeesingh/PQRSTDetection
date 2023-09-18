@@ -7,6 +7,10 @@ import neurokit2 as nk
 import numpy as np
 from scipy.signal import butter, filtfilt
 import pywt
+import wfdb
+import cv2
+from scipy.interpolate import interp1d
+from scipy.signal import find_peaks
 
 
 class ECG_Analyzer:
@@ -71,6 +75,14 @@ class ECG_Analyzer:
         return filtered_data
 
     def extractRPeaks(self):
+        # if forImage:
+        #     times, voltages = [], []
+        #     for t, v in data_points:
+        #         times.append(t)
+        #         voltages.append(v)
+
+        #     peaks, _ = find_peaks(voltages, distance=100, height=0.5)  # Adjust parameters as needed
+
         # Construct the file names
         hea_file = self.header
         dat_file = self.dat
@@ -137,7 +149,9 @@ class ECG_Analyzer:
         # Parse the header file to get necessary metadata
         num_leads = int(header[0].split()[1])
         num_samples = int(header[0].split()[3])
-        sampling_frequency = float(header[0].split()[2])
+        # sampling_frequency = float(header[0].split()[2])
+        sampling_frequency = 10**5
+
         data_format = header[1].split()[1]
 
         scaling_factor, offset = map(
@@ -170,7 +184,6 @@ class ECG_Analyzer:
 
         # Create a list of tuples of (time, amplitude) pairs
         data_points = list(zip(time, lead_ii_data))
-
         return data_points
 
     def extractQPeaks(self, data_points, r_peaks):
@@ -383,12 +396,91 @@ class ECG_Analyzer:
 
         return tPeaksArr
 
-    def makePlot(
-        self,
-        saveImg=False,
-        xStart=0,
-        xEnd=5,
-    ):
+    def processImg(self, img_path):
+        # Load the image and force it to be grayscale
+        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+
+        # Set anything below 127 to 0 and anything above as the max
+        _, thresh = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
+
+        # Get image height
+        img_height = img.shape[0]
+
+        # Initialize the result list
+        result = []
+
+        # Iterate over each column in the image
+        for x in range(thresh.shape[1]):
+            column = thresh[:, x]
+
+            # Get the y-coordinate of the white pixel
+            y_coords = np.where(column == 255)
+
+            # There might be noise or multiple white pixels in a column.
+            # We take the average of y-coordinates in such cases.
+            if y_coords[0].size > 0:
+                y_avg = int(np.mean(y_coords))
+                result.append(
+                    (x, img_height - y_avg)
+                )  # Subtracting from img_height to get distance from bottom
+
+        # Convert the result list into a time and voltage vector
+        times = [x for x, _ in result]
+        voltages = [y for _, y in result]
+
+        f = interp1d(times, voltages, kind="linear")
+
+        new_times = np.linspace(min(times), max(times), len(times))
+        new_voltages = f(new_times)
+
+        return list(zip(new_times, new_voltages))
+
+    def getAllPeaks(self, plot):
+        # if forImage and img_path:
+        #     data_points = self.processImg(img_path)
+        #     r_peaks = self.extractRPeaks(True, data_points)
+        #     qPeaksArr = self.extractQPeaks(data_points, r_peaks)
+        #     sPeaksArr = self.extractSPeaks(data_points, r_peaks)
+        #     pPeaksArr = self.extractPPeaks(data_points, qPeaksArr, 0.2)
+        #     tPeaksArr = self.extractTPeaks(data_points, sPeaksArr, 0.3)  # <-
+        #     self.pPeaks, self.qPeaks, self.rPeaks, self.sPeaks, self.tPeaks = pPeaksArr, qPeaksArr, r_peaks, sPeaksArr, tPeaksArr
+        # else:
+        r_peaks = self.extractRPeaks()
+        data_points = self.extractData()
+        print(data_points)
+        import pdb
+
+        pdb.set_trace()
+
+        qPeaksArr = self.extractQPeaks(data_points, r_peaks)
+        sPeaksArr = self.extractSPeaks(data_points, r_peaks)
+        pPeaksArr = self.extractPPeaks(data_points, qPeaksArr, 0.2)
+        tPeaksArr = self.extractTPeaks(
+            data_points, sPeaksArr, 0.3
+        )  # <- we need to figure out how to adjust this based on the waveform (0.4)
+        self.pPeaks, self.qPeaks, self.rPeaks, self.sPeaks, self.tPeaks = (
+            pPeaksArr,
+            qPeaksArr,
+            r_peaks,
+            sPeaksArr,
+            tPeaksArr,
+        )
+
+        print(qPeaksArr)
+        if plot:
+            self.makePlot(forImage=True)
+
+        output = {
+            "P_Peaks": pPeaksArr,
+            "Q_Peaks": qPeaksArr,
+            "R_Peaks": r_peaks,
+            "S_Peaks": sPeaksArr,
+            "T_Peaks": tPeaksArr,
+        }
+
+        return output
+
+    def makePlot(self, forImage, saveImg=False, xStart=0, xEnd=5):
         # Construct the file names
         hea_file = self.header
         dat_file = self.dat
@@ -479,41 +571,15 @@ class ECG_Analyzer:
 
         plt.show()
 
-    def getAllPeaks(self, plot=False):
-        r_peaks = self.extractRPeaks()
-        data_points = self.extractData()
-        qPeaksArr = self.extractQPeaks(data_points, r_peaks)
-        sPeaksArr = self.extractSPeaks(data_points, r_peaks)
-        pPeaksArr = self.extractPPeaks(data_points, qPeaksArr, 0.2)
-        tPeaksArr = self.extractTPeaks(
-            data_points, sPeaksArr, 0.3
-        )  # <- we need to figure out how to adjust this based on the waveform (0.4)
-
-        self.pPeaks, self.qPeaks, self.rPeaks, self.sPeaks, self.tPeaks = (
-            pPeaksArr,
-            qPeaksArr,
-            r_peaks,
-            sPeaksArr,
-            tPeaksArr,
-        )
-
-        if plot:
-            self.makePlot()
-
-        output = {
-            "P_Peaks": pPeaksArr,
-            "Q_Peaks": qPeaksArr,
-            "R_Peaks": r_peaks,
-            "S_Peaks": sPeaksArr,
-            "T_Peaks": tPeaksArr,
-        }
-
-        return output
-
 
 header = "/Users/bryanjangeesingh/Downloads/brno-university-of-technology-ecg-signal-database-with-annotations-of-p-wave-but-pdb-1.0.0/31.hea"
 dat = "/Users/bryanjangeesingh/Downloads/brno-university-of-technology-ecg-signal-database-with-annotations-of-p-wave-but-pdb-1.0.0/31.dat"
+
+
+# header = "/Users/bryanjangeesingh/Desktop/my_ecg_record.hea"
+# dat = "/Users/bryanjangeesingh/Desktop/my_ecg_record.dat"
+
 lead = 0
 myEcg = ECG_Analyzer(header, dat, lead)
-
-myDict = myEcg.getAllPeaks(plot=True)
+# image_path = "/Users/bryanjangeesingh/Desktop/ecg8bit.png"
+myDict = myEcg.getAllPeaks(True)
