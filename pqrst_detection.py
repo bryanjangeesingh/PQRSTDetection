@@ -7,14 +7,12 @@ import neurokit2 as nk
 import numpy as np
 from scipy.signal import butter, filtfilt
 import pywt
-import wfdb
 import cv2
-from scipy.interpolate import interp1d
-from scipy.signal import find_peaks
+import random
 
 
 class ECG_Analyzer:
-    def __init__(self, header, dat, lead_index):
+    def __init__(self, header, dat, lead_index, sampling_rate, image_path=None):
         self.header = header
         self.dat = dat
         self.lead_index = lead_index
@@ -25,6 +23,51 @@ class ECG_Analyzer:
             [],
             [],
         )
+
+        if image_path:
+            image_data_points = self.extract_ecg_data(image_path, 200)
+            self.image_data_points = image_data_points
+
+    def add_random_noise(self, value):
+        noise = random.uniform(-1.5, 1.5)
+        return value + noise
+
+    def extract_ecg_data(self, image_path, sampling_rate):
+        # Load the image and force it to be grayscale
+        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+
+        # Set anything below 127 to 0 and anything above as the max
+        _, thresh = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
+
+        # Get image height
+        img_height = img.shape[0]
+
+        # Initialize the result list
+        result = []
+
+        # Iterate over each column in the image
+        for x in range(thresh.shape[1]):
+            column = thresh[:, x]
+
+            # Get the y-coordinate of the white pixel
+            y_coords = np.where(column == 255)
+
+            # There might be noise or multiple white pixels in a column.
+            # We take the average of y-coordinates in such cases.
+            if y_coords[0].size > 0:
+                y_avg = int(np.mean(y_coords))
+                result.append(
+                    (x, img_height - y_avg)
+                )  # Subtracting from img_height to get distance from bottom
+
+        # Convert the result list into a time and voltage vector
+        times = [x for x, _ in result]
+        voltages = [y for _, y in result]
+        series = [
+            (x * 1 / 294, self.add_random_noise(y)) for x, y in zip(times, voltages)
+        ]
+
+        return series
 
     def find_closest_value(self, a, b):
         """
@@ -74,14 +117,74 @@ class ECG_Analyzer:
 
         return filtered_data
 
-    def extractRPeaks(self):
-        # if forImage:
-        #     times, voltages = [], []
-        #     for t, v in data_points:
-        #         times.append(t)
-        #         voltages.append(v)
+    def extractRPeaks(self, forImage=None):
+        if forImage:
+            series = self.image_data_points
+            voltage_lookup = {round(time * 294): voltage for time, voltage in series}
+            series = np.array(series)[:, 1]
+            _, rpeaks = nk.ecg_peaks(series, sampling_rate=294, method="martinez2004")
+            rpeaks = rpeaks["ECG_R_Peaks"]
+            corresponding_voltages_for_rpeaks = [voltage_lookup[rpk] for rpk in rpeaks]
+            r_peaks = list(zip(rpeaks, corresponding_voltages_for_rpeaks))
+            return r_peaks
+        else:
+            # Construct the file names
+            hea_file = self.header
+            dat_file = self.dat
 
-        #     peaks, _ = find_peaks(voltages, distance=100, height=0.5)  # Adjust parameters as needed
+            # Read the header file
+            with open(hea_file, "r") as f:
+                header = f.readlines()
+
+            # Parse the header file to get necessary metadata
+            num_leads = int(header[0].split()[1])
+            num_samples = int(header[0].split()[3])
+            sampling_frequency = float(header[0].split()[2])
+            data_format = header[1].split()[1]
+
+            # Extract the scaling factor and offset from the header file
+            scaling_factor, offset = map(
+                float, re.findall(r"[-+]?\d*\.\d+|\d+", header[1].split()[2])
+            )
+
+            # Read the data file
+            if data_format == "16":
+                dtype = np.int16
+            elif data_format == "32":
+                dtype = np.float32
+            else:
+                raise ValueError("Unknown data format")
+
+            data = np.fromfile(dat_file, dtype=dtype)
+
+            # Reshape the data
+            data = data.reshape((num_samples, num_leads))
+
+            # Convert the data to microvolts
+            data = (data - offset) / scaling_factor
+
+            # Get the index of Lead II
+            lead_ii_index = self.lead_index  # adjust this if necessary
+
+            # Extract the data for Lead II
+            lead_ii_data = data[:, lead_ii_index]
+
+            # Detect R-peaks using nk.ecg_peaks
+            _, rpeaks = nk.ecg_peaks(lead_ii_data, sampling_rate=sampling_frequency)
+
+            # Extract R-peaks indices
+            rpeaks_indices = rpeaks["ECG_R_Peaks"]
+
+            # Create a list of tuples of (time, amplitude) pairs for the R-peaks
+            rpeak_times = rpeaks_indices / sampling_frequency
+            rpeak_amplitudes = lead_ii_data[rpeaks_indices]
+            rpeak_points = list(zip(rpeak_times, rpeak_amplitudes))
+
+            return rpeak_points
+
+    def extractData(self, forImage=None):
+        if forImage:
+            return self.image_data_points
 
         # Construct the file names
         hea_file = self.header
@@ -95,63 +198,6 @@ class ECG_Analyzer:
         num_leads = int(header[0].split()[1])
         num_samples = int(header[0].split()[3])
         sampling_frequency = float(header[0].split()[2])
-        data_format = header[1].split()[1]
-
-        # Extract the scaling factor and offset from the header file
-        scaling_factor, offset = map(
-            float, re.findall(r"[-+]?\d*\.\d+|\d+", header[1].split()[2])
-        )
-
-        # Read the data file
-        if data_format == "16":
-            dtype = np.int16
-        elif data_format == "32":
-            dtype = np.float32
-        else:
-            raise ValueError("Unknown data format")
-
-        data = np.fromfile(dat_file, dtype=dtype)
-
-        # Reshape the data
-        data = data.reshape((num_samples, num_leads))
-
-        # Convert the data to microvolts
-        data = (data - offset) / scaling_factor
-
-        # Get the index of Lead II
-        lead_ii_index = self.lead_index  # adjust this if necessary
-
-        # Extract the data for Lead II
-        lead_ii_data = data[:, lead_ii_index]
-
-        # Detect R-peaks using nk.ecg_peaks
-        _, rpeaks = nk.ecg_peaks(lead_ii_data, sampling_rate=sampling_frequency)
-
-        # Extract R-peaks indices
-        rpeaks_indices = rpeaks["ECG_R_Peaks"]
-
-        # Create a list of tuples of (time, amplitude) pairs for the R-peaks
-        rpeak_times = rpeaks_indices / sampling_frequency
-        rpeak_amplitudes = lead_ii_data[rpeaks_indices]
-        rpeak_points = list(zip(rpeak_times, rpeak_amplitudes))
-
-        return rpeak_points
-
-    def extractData(self):
-        # Construct the file names
-        hea_file = self.header
-        dat_file = self.dat
-
-        # Read the header file
-        with open(hea_file, "r") as f:
-            header = f.readlines()
-
-        # Parse the header file to get necessary metadata
-        num_leads = int(header[0].split()[1])
-        num_samples = int(header[0].split()[3])
-        # sampling_frequency = float(header[0].split()[2])
-        sampling_frequency = 10**5
-
         data_format = header[1].split()[1]
 
         scaling_factor, offset = map(
@@ -184,6 +230,7 @@ class ECG_Analyzer:
 
         # Create a list of tuples of (time, amplitude) pairs
         data_points = list(zip(time, lead_ii_data))
+
         return data_points
 
     def extractQPeaks(self, data_points, r_peaks):
@@ -396,68 +443,156 @@ class ECG_Analyzer:
 
         return tPeaksArr
 
-    def processImg(self, img_path):
-        # Load the image and force it to be grayscale
-        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    def makePlot(self, saveImg=False, xStart=0, xEnd=5, forImage=None):
+        if not forImage:
+            # Construct the file names
+            hea_file = self.header
+            dat_file = self.dat
 
-        # Set anything below 127 to 0 and anything above as the max
-        _, thresh = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
+            # Read the header file
+            with open(hea_file, "r") as f:
+                header = f.readlines()
 
-        # Get image height
-        img_height = img.shape[0]
+            # Parse the header file to get necessary metadata
+            num_leads = int(header[0].split()[1])
+            num_samples = int(header[0].split()[3])
+            sampling_frequency = float(header[0].split()[2])
+            data_format = header[1].split()[1]
 
-        # Initialize the result list
-        result = []
+            # Extract the scaling factor and offset from the header file
+            scaling_factor, offset = map(
+                float, re.findall(r"[-+]?\d*\.\d+|\d+", header[1].split()[2])
+            )
 
-        # Iterate over each column in the image
-        for x in range(thresh.shape[1]):
-            column = thresh[:, x]
+            # Read the data file
+            if data_format == "16":
+                dtype = np.int16
+            elif data_format == "32":
+                dtype = np.float32
+            else:
+                raise ValueError("Unknown data format")
 
-            # Get the y-coordinate of the white pixel
-            y_coords = np.where(column == 255)
+            data = np.fromfile(dat_file, dtype=dtype)
 
-            # There might be noise or multiple white pixels in a column.
-            # We take the average of y-coordinates in such cases.
-            if y_coords[0].size > 0:
-                y_avg = int(np.mean(y_coords))
-                result.append(
-                    (x, img_height - y_avg)
-                )  # Subtracting from img_height to get distance from bottom
+            # Reshape the data
+            data = data.reshape((num_samples, num_leads))
 
-        # Convert the result list into a time and voltage vector
-        times = [x for x, _ in result]
-        voltages = [y for _, y in result]
+            # Convert the data to microvolts
+            data = (data - offset) / scaling_factor
 
-        f = interp1d(times, voltages, kind="linear")
+            # Create a time array in seconds
+            time = np.arange(num_samples) / sampling_frequency
 
-        new_times = np.linspace(min(times), max(times), len(times))
-        new_voltages = f(new_times)
+            lead_ii_index = self.lead_index  # adjust this if necessary
 
-        return list(zip(new_times, new_voltages))
+            # do the plotting
+            # Plot the ECG data
+            plt.figure(figsize=(12, 6))
+            plt.plot(time, data[:, lead_ii_index], label="Lead II")
 
-    def getAllPeaks(self, plot):
-        # if forImage and img_path:
-        #     data_points = self.processImg(img_path)
-        #     r_peaks = self.extractRPeaks(True, data_points)
-        #     qPeaksArr = self.extractQPeaks(data_points, r_peaks)
-        #     sPeaksArr = self.extractSPeaks(data_points, r_peaks)
-        #     pPeaksArr = self.extractPPeaks(data_points, qPeaksArr, 0.2)
-        #     tPeaksArr = self.extractTPeaks(data_points, sPeaksArr, 0.3)  # <-
-        #     self.pPeaks, self.qPeaks, self.rPeaks, self.sPeaks, self.tPeaks = pPeaksArr, qPeaksArr, r_peaks, sPeaksArr, tPeaksArr
-        # else:
-        r_peaks = self.extractRPeaks()
-        data_points = self.extractData()
+            plt.xlabel("Time (seconds)")
+            plt.ylabel("Amplitude (uV)")
+            plt.title(f"ECG Data")
+            plt.legend()
+            plt.xlim(xStart, xEnd)
+
+            plt.grid(True)
+
+            x, y = zip(*self.rPeaks)
+            plt.scatter(x, y, color="red")
+            for i, txt in enumerate(y):
+                plt.annotate("R", (x[i], y[i]))
+
+            x1, y1 = zip(*self.qPeaks)
+            plt.scatter(x1, y1, color="Green")
+            for i, txt in enumerate(y1):
+                plt.annotate("Q", (x1[i], y1[i]))
+
+            x2, y2 = zip(*self.sPeaks)
+            plt.scatter(x2, y2, color="purple")
+            for i, txt in enumerate(y2):
+                plt.annotate("S", (x2[i], y2[i]))
+
+            x3, y3 = zip(*self.tPeaks)
+            plt.scatter(x3, y3, color="orange")
+            for i, txt in enumerate(y3):
+                plt.annotate("T", (x3[i], y3[i]))
+
+            x4, y4 = zip(*self.pPeaks)
+            plt.scatter(x4, y4, color="orange")
+            for i, txt in enumerate(y4):
+                plt.annotate("P", (x4[i], y4[i]))
+
+            if saveImg:
+                current_directory = os.path.dirname(os.path.abspath(__file__))
+                new_directory = "myECGPlots"
+                path = os.path.join(current_directory, new_directory)
+                # check if the directory already exists
+                if not os.path.exists(path):
+                    os.mkdir(path)
+                    print(f"Directory '{new_directory}' created")
+
+                plt.savefig(os.path.join(output_dir))
+
+            plt.show()
+
+        else:
+            series = self.image_data_points
+
+            data = np.array(series)[:, 1]
+            time = np.arange(len(data))
+            plt.plot(time, data)
+
+            plt.xlabel("Time (seconds)")
+            plt.ylabel("Amplitude")
+            plt.title(f"ECG Data")
+            plt.legend()
+
+            plt.grid(True)
+
+            x, y = zip(*self.rPeaks)
+            plt.scatter(x, y, color="red")
+            for i, txt in enumerate(y):
+                plt.annotate("R", (x[i], y[i]))
+
+            x1, y1 = zip(*self.qPeaks)
+            plt.scatter(x1, y1, color="Green")
+            for i, txt in enumerate(y1):
+                plt.annotate("Q", (x1[i], y1[i]))
+
+            x2, y2 = zip(*self.sPeaks)
+            plt.scatter(x2, y2, color="purple")
+            for i, txt in enumerate(y2):
+                plt.annotate("S", (x2[i], y2[i]))
+
+            x3, y3 = zip(*self.tPeaks)
+            plt.scatter(x3, y3, color="orange")
+            for i, txt in enumerate(y3):
+                plt.annotate("T", (x3[i], y3[i]))
+
+            x4, y4 = zip(*self.pPeaks)
+            plt.scatter(x4, y4, color="orange")
+            for i, txt in enumerate(y4):
+                plt.annotate("P", (x4[i], y4[i]))
+
+            plt.show()
+
+    def getAllPeaks(self, plot=None, image=None):
+        if image:
+            r_peaks = self.extractRPeaks(forImage=True)
+            data_points = [(x * 294, y) for x, y in self.image_data_points]
+        else:
+            r_peaks = self.extractRPeaks()
+            data_points = self.extractData()
+
         print(data_points)
-        import pdb
-
-        pdb.set_trace()
-
         qPeaksArr = self.extractQPeaks(data_points, r_peaks)
         sPeaksArr = self.extractSPeaks(data_points, r_peaks)
-        pPeaksArr = self.extractPPeaks(data_points, qPeaksArr, 0.2)
+        pPeaksArr = self.extractPPeaks(data_points, qPeaksArr, 30)  # 0.2 is here
         tPeaksArr = self.extractTPeaks(
-            data_points, sPeaksArr, 0.3
+            data_points, sPeaksArr, 41
         )  # <- we need to figure out how to adjust this based on the waveform (0.4)
+
         self.pPeaks, self.qPeaks, self.rPeaks, self.sPeaks, self.tPeaks = (
             pPeaksArr,
             qPeaksArr,
@@ -466,7 +601,6 @@ class ECG_Analyzer:
             tPeaksArr,
         )
 
-        print(qPeaksArr)
         if plot:
             self.makePlot(forImage=True)
 
@@ -480,106 +614,28 @@ class ECG_Analyzer:
 
         return output
 
-    def makePlot(self, forImage, saveImg=False, xStart=0, xEnd=5):
-        # Construct the file names
-        hea_file = self.header
-        dat_file = self.dat
 
-        # Read the header file
-        with open(hea_file, "r") as f:
-            header = f.readlines()
-
-        # Parse the header file to get necessary metadata
-        num_leads = int(header[0].split()[1])
-        num_samples = int(header[0].split()[3])
-        sampling_frequency = float(header[0].split()[2])
-        data_format = header[1].split()[1]
-
-        # Extract the scaling factor and offset from the header file
-        scaling_factor, offset = map(
-            float, re.findall(r"[-+]?\d*\.\d+|\d+", header[1].split()[2])
-        )
-
-        # Read the data file
-        if data_format == "16":
-            dtype = np.int16
-        elif data_format == "32":
-            dtype = np.float32
-        else:
-            raise ValueError("Unknown data format")
-
-        data = np.fromfile(dat_file, dtype=dtype)
-
-        # Reshape the data
-        data = data.reshape((num_samples, num_leads))
-
-        # Convert the data to microvolts
-        data = (data - offset) / scaling_factor
-
-        # Create a time array in seconds
-        time = np.arange(num_samples) / sampling_frequency
-
-        lead_ii_index = self.lead_index  # adjust this if necessary
-
-        # Plot the ECG data
-        plt.figure(figsize=(12, 6))
-        plt.plot(time, data[:, lead_ii_index], label="Lead II")
-
-        plt.xlabel("Time (seconds)")
-        plt.ylabel("Amplitude (uV)")
-        plt.title(f"ECG Data")
-        plt.legend()
-        plt.xlim(xStart, xEnd)
-
-        plt.grid(True)
-
-        x, y = zip(*self.rPeaks)
-        plt.scatter(x, y, color="red")
-        for i, txt in enumerate(y):
-            plt.annotate("R", (x[i], y[i]))
-
-        x1, y1 = zip(*self.qPeaks)
-        plt.scatter(x1, y1, color="Green")
-        for i, txt in enumerate(y1):
-            plt.annotate("Q", (x1[i], y1[i]))
-
-        x2, y2 = zip(*self.sPeaks)
-        plt.scatter(x2, y2, color="purple")
-        for i, txt in enumerate(y2):
-            plt.annotate("S", (x2[i], y2[i]))
-
-        x3, y3 = zip(*self.tPeaks)
-        plt.scatter(x3, y3, color="orange")
-        for i, txt in enumerate(y3):
-            plt.annotate("T", (x3[i], y3[i]))
-
-        x4, y4 = zip(*self.pPeaks)
-        plt.scatter(x4, y4, color="orange")
-        for i, txt in enumerate(y4):
-            plt.annotate("P", (x4[i], y4[i]))
-
-        if saveImg:
-            current_directory = os.path.dirname(os.path.abspath(__file__))
-            new_directory = "myECGPlots"
-            path = os.path.join(current_directory, new_directory)
-            # check if the directory already exists
-            if not os.path.exists(path):
-                os.mkdir(path)
-                print(f"Directory '{new_directory}' created")
-
-            plt.savefig(os.path.join(output_dir))
-
-        plt.show()
-
-
-header = "/Users/bryanjangeesingh/Downloads/brno-university-of-technology-ecg-signal-database-with-annotations-of-p-wave-but-pdb-1.0.0/31.hea"
-dat = "/Users/bryanjangeesingh/Downloads/brno-university-of-technology-ecg-signal-database-with-annotations-of-p-wave-but-pdb-1.0.0/31.dat"
-
-
-# header = "/Users/bryanjangeesingh/Desktop/my_ecg_record.hea"
-# dat = "/Users/bryanjangeesingh/Desktop/my_ecg_record.dat"
+header = "/Users/bryanjangeesingh/Downloads/brno-university-of-technology-ecg-signal-database-with-annotations-of-p-wave-but-pdb-1.0.0/32.hea"
+dat = "/Users/bryanjangeesingh/Downloads/brno-university-of-technology-ecg-signal-database-with-annotations-of-p-wave-but-pdb-1.0.0/32.dat"
+image_path = "/Users/bryanjangeesingh/Desktop/ecg8bit.png"
 
 lead = 0
-myEcg = ECG_Analyzer(header, dat, lead)
-# image_path = "/Users/bryanjangeesingh/Desktop/ecg8bit.png"
-myDict = myEcg.getAllPeaks(True)
+myEcg = ECG_Analyzer(header, dat, lead, 200, image_path)
+
+
+myDict = myEcg.getAllPeaks(True, True)["R_Peaks"]
+print(myDict)
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
